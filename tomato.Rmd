@@ -1,0 +1,515 @@
+---
+title: "simba_parma_secondo_anno"
+author: "LC"
+date: '2022-10-12'
+output: html_document
+---
+
+#TOMATO
+```{r}
+
+memory.limit(size=140000) 
+library(dada2); packageVersion("dada2")
+
+#setwd and path containing fastq files
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/data_august22/2022-08-30_iga/TOMATO/raw_reads_cutadapt")
+
+path <- "C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/data_august22/2022-08-30_iga/TOMATO/raw_reads_cutadapt" 
+
+list.files(path)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+```
+
+```{r}
+
+#Inspect read quality profiles
+#We start by visualizing the quality profiles of the forward reads:
+  
+plotQualityProfile(fnFs[1:10])
+
+# In gray-scale is a heat map of the frequency of each quality score at each base position. The mean quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+  
+ # The forward reads are good quality. We generally advise trimming the last few nucleotides to avoid less well-controlled errors that can arise there. These quality profiles do not suggest that any additional trimming is needed. We will truncate the forward reads at position 240 (trimming the last 10 nucleotides).
+  
+ # Now we visualize the quality profile of the reverse reads:
+    
+plotQualityProfile(fnRs[1:10])
+
+
+```
+
+```{r}
+
+# Filter and trim
+    
+#Assign the filenames for the filtered fastq.gz files.
+    
+# Place filtered files in filtered/ subdirectory
+    
+    filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+    filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+    names(filtFs) <- sample.names
+    names(filtRs) <- sample.names
+    length(filtFs)
+    length(filtRs)
+    
+# We'll use standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2. The maxEE parameter sets the maximum number of "expected errors" allowed in a read, which is a better filter than simply averaging quality scores.
+    
+    any(duplicated(c(fnFs, fnRs)))
+    any(duplicated(c(filtFs, filtRs)))
+    
+    
+    head(filtFs)
+    head(filtRs) #cambia nome quando hai _1_R1 e sostituisci con -1_R1
+    
+    length(fnFs) 
+    length(fnRs)
+    
+    
+    
+    
+    out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                         truncLen=c(280,250), minLen = c(240,200),
+                         maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                         compress=TRUE,  multithread=FALSE) # On Windows set multithread=FALSE
+    head(out)  
+#write.csv(out, "out.csv")
+
+```
+
+```{r}
+
+#Learn the Error Rates
+# The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. The learnErrors method learns this error model from the data, by alternating estimation of the error rates and inference of sample composition until 
+    # they converge on a jointly consistent solution. As in many machine-learning problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors).  
+    
+errF <- learnErrors(filtFs, multithread=FALSE)
+
+errR<- learnErrors(filtRs, multithread=FALSE)
+
+
+
+
+#It is always worthwhile, as a sanity check if nothing else, to visualize the estimated error rates:
+      
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+#The error rates for each possible transition (A→C, A→G, …) are shown. Points are the observed error rates for each consensus quality score. The black line shows the estimated error rates after convergence of the machine-learning algorithm. The red line shows the error rates expected under the nominal definition of the Q-score. 
+      
+
+```
+
+```{r}
+
+#Dereplicating: Dereplication combines all identical sequencing reads into into “unique sequences” with a corresponding “abundance”: the number of reads with that unique sequence. Dereplication substantially reduces computation time by eliminating redundant comparisons.
+
+table(file.exists(filtFs)) 
+table(file.exists(filtRs))
+
+exists <- file.exists(filtFs) & file.exists(filtRs)
+filtFs <- filtFs[exists]
+filtRs <- filtRs[exists]
+
+length(filtFs)
+length(filtRs)
+
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names[exists]
+names(derepRs) <- sample.names[exists]
+
+```
+
+```{r}
+
+#Sample Inference
+
+dadaFs <- dada(derepFs, err=errF, multithread=FALSE)
+dadaRs <- dada(derepRs, err=errR, multithread=FALSE)
+      
+#Inspecting the returned dada-class object:
+        
+dadaFs[[1]]
+
+## dada-class: object describing DADA2 denoising results
+## 744 sequence variants were inferred from 46754 input unique sequences.
+## Key parameters: OMEGA_A = 1e-40, OMEGA_C = 1e-40, BAND_SIZE = 16
+#The DADA2 algorithm inferred 128 true sequence variants from the 1979 unique sequences in the first sample. 
+
+```
+
+```{r}
+
+#Merge paired reads
+#We now merge the forward and reverse reads together to obtain the full denoised sequences. Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences. By default, merged sequences are only output if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region (but these conditions can be changed via function arguments).
+
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+#The mergers object is a list of data.frames from each sample. Each data.frame contains the merged $sequence, its $abundance, and the indices of the $forward and $reverse sequence variants that were merged. Paired reads that did not exactly overlap were removed by mergePairs, further reducing spurious output.
+
+#Construct sequence table
+#We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+seqtab1_2 <- seqtab[,nchar(colnames(seqtab))%in%430:480]
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+table(nchar(getSequences(seqtab1_2))) #cosi rimuovo anche le reads da 312 basi e sono 1299, non sono sicura vada bene
+
+#The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants. This table contains 293 ASVs, and the lengths of our merged sequences all fall within the expected range for this V4 amplicon.
+
+
+```
+
+```{r}
+
+#Remove chimeras
+#The core dada method corrects substitution and indel errors, but chimeras remain. Fortunately, the accuracy of sequence variants after denoising makes identifying chimeric ASVs simpler than when dealing with fuzzy OTUs. Chimeric sequences are identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant “parent” sequences.
+
+
+#seqtab2
+
+seqtab.nochim <- removeBimeraDenovo(seqtab1_2, method="consensus", multithread=FALSE, verbose=TRUE)
+dim(seqtab.nochim)
+
+sum(seqtab.nochim)/sum(seqtab1_2)
+ #The frequency of chimeric sequences varies substantially from dataset to dataset, and depends on on factors including experimental procedures and sample complexity. 
+#Most of your reads should remain after chimera removal
+
+#Track reads through the pipeline
+#As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+  
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+
+
+```
+
+```{r}
+
+#Assign taxonomy
+##It is common at this point, especially in 16S/18S/ITS amplicon sequencing, to assign taxonomy to the sequence variants. The DADA2 package provides a native implementation of the naive Bayesian classifier method for this purpose. The assignTaxonomy function takes as input a set of sequences to be classified and a training set of reference sequences with known taxonomy, and outputs taxonomic assignments with at least minBoot bootstrap confidence.
+
+# try this way (giova dice sia meglio)
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+#BiocManager::install("DECIPHER")
+
+library(DECIPHER); packageVersion("DECIPHER")
+library(dada2)
+
+memory.limit(size = 140000)
+file.exists("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/data_august22/SILVA_SSU_r138_2019.RData")
+dna <- DNAStringSet(getSequences(seqtab.nochim)) # Create a DNAStringSet from the ASVs
+load("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/data_august22/SILVA_SSU_r138_2019.RData") # CHANGE TO THE PATH OF YOUR TRAINING SET
+ids <- IdTaxa(dna, trainingSet, strand="both", processors=NULL, verbose=FALSE) # use all processors #strand metti both 
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species") # ranks of interest
+# Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+taxid <- t(sapply(ids, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(taxid) <- ranks; rownames(taxid) <- getSequences(seqtab.nochim)
+###### End of DADA2 part.
+```
+
+
+
+```{r}
+#phyloseq part
+library(phyloseq)
+library(ggplot2)      
+library(dplyr)      
+
+# Reading data
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/data_august22/2022-08-30_iga/TOMATO/R files")
+meta <- read.csv("metadata_tomato.csv", sep = ";")
+row.names(meta) <- meta$sample
+samdf = subset(meta, select = -c(sample) )
+counts <- seqtab.nochim
+taxa <- taxid
+
+  
+# Building phyloseq object
+ps <- phyloseq(otu_table(counts, taxa_are_rows = F),
+                    tax_table(taxa),
+                    sample_data(samdf))
+
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+
+ps <- subset_taxa(ps, phylum != "NA")
+ps <- subset_taxa(ps, domain != "Archea")
+
+#rimuovo il campione CHAR-MCB-X2-AMF2021-1 perché reads<10000
+ps = subset_samples(ps, sample != "CHAR-MCB-X2-AMF2021-1")
+ps <- prune_samples(sample_names(ps) != "CHAR-MCB-X2-AMF2021-1" ,ps)
+```
+
+ps_arc <- subset_taxa(ps, domain != "Archaea")
+5949 - 4553 = 1396 sono Archaea
+
+5949-4378= 1571 NA phylum
+```{r}
+#barplot >0.05 con abbondanza relativa
+#abbrel_all.svg
+x <- tax_glom(ps, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(ps)
+theme_set(theme_bw())
+tax_glom(ps, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9))+
+  labs(y = "Relative abundance") 
+  
+  
+par(mfrow=c(1,5))
+```
+
+```{r}
+##non normalizzati, continuo di dada2 tutorial
+#Visualize alpha-diversity:
+
+# alphadiv_treatment.svg
+plot_richness(ps, x="treatment", measures=c("Shannon", "Simpson"), color="treatment")
+
+
+
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+a <- plot_bar(ps.top20, x="Sample", fill="phylum") + facet_wrap(~treatment, scales="fixed")+ theme(text = element_text(size = 2))
+a + theme(text = element_text(size = 15), axis.text.x = element_text(angle = 90), legend.text = element_text( size = 20) )
+par(mfrow=c(1,10))
+
+
+all <- names(sort(taxa_sums(ps), decreasing=TRUE))
+ps.all <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.all <- prune_taxa(all, ps.all)
+plot_bar(ps.all, x="Sample", fill="phylum") + facet_wrap(~treatment, scales="free")+ theme(text = element_text(size = 10))
+
+#Ordinate:
+#NMDS_all.svg
+# Transform data to proportions as appropriate for Bray-Curtis distances
+ps.prop <- transform_sample_counts(ps, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+
+plot_ordination(ps.prop, ord.nmds.bray, color="treatment", title="Bray NMDS")
+```
+
+
+```{r}
+library(ranacapa)
+library(ggplot2)
+
+#rarecurve2
+
+rare <- ggrare(ps, step = 1000, color = "treatment", label = "Sample", se = FALSE) + theme(text = element_text(size = 10))
+rare
+
+```
+
+```{r}
+#Alpha diversity, Shannon, Richness, Eveness indexes
+library(microbiome)
+library(ggpubr)
+library(knitr)
+
+#alphadiv
+
+ps1 <- prune_taxa(taxa_sums(ps) > 0, ps)
+
+tab <- alpha(ps, index = "all", zeroes = TRUE)
+#write.csv(tab, "alpha.csv")
+tab0 <- evenness(ps1)
+#write.csv(tab0, "evenness.csv")
+tab1 <- richness(ps1)
+#write.csv(tab1, "richness.csv")
+tab2 <- diversity(ps1)
+#write.csv(tab2, "diversity.csv")
+tab3 <- coverage(ps1)
+#write.csv(tab3, "coverage.csv")
+
+#install.packages("remotes")
+#remotes::install_github("jfq3/QsRutils")
+library(QsRutils)
+
+#Goods coverage
+tab4 <- goods(counts)
+#write.csv(tab4, "goods_coverage.csv")
+
+ps.meta <- meta(ps1)
+kable(head(ps.meta))
+
+ps.meta$shannon <- tab2$shannon 
+library(base)
+
+
+bmi <- c("CHAR", "CHAR + AMF", "CHAR + F1", "CHAR + MC B + AMF 2020", "CHAR + MC B + AMF 2021", "CHAR + MC B X2 + AMF 2021", "CHAR + MC B 2021", "CHAR", "CONTROL")
+
+bmi.pairs <- combn(seq_along(bmi), 2, simplify = FALSE, FUN = function(i)bmi[i])
+
+print(bmi.pairs)
+
+p <- ggviolin(ps.meta, x = "treatment", y = "shannon",
+ add = "boxplot", fill = "treatment")
+print(p)
+
+p <- p + stat_compare_means(comparisons = bmi.pairs, method = "wilcox.test")  + theme(text = element_text(size=8))
+print(p)
+
+ps.meta$simpson <- tab0$simpson 
+
+p1 <- ggviolin(ps.meta, x = "treatment", y = "simpson", add = "boxplot", fill = "treatment")  + theme(text = element_text(size=8))
+print(p1)
+
+p1 <- p1 + stat_compare_means(comparisons = bmi.pairs, method = "wilcox.test")
+print(p1)
+```
+
+library(phyloseq)
+```{r}
+#DESeq2
+#Construct DESEQDataSet Object
+library(DESeq2)
+
+dds_treatment <- phyloseq_to_deseq2(ps, design = ~treatment)
+
+dds_treatment <- estimateSizeFactors(dds_treatment, type = 'poscounts')
+
+dds_treatment <- DESeq(dds_treatment)
+
+res_treatment <- results(dds_treatment)
+
+res_treatment <- res_treatment[order(res_treatment$padj),]
+
+head(res_treatment)
+
+#write.csv(res_treatment, "res treatment.csv")
+```
+
+
+
+```{r}
+#PCA deseq2 a una matrice per:
+#First we need to transform the raw count data
+#vst function will perform variance stabilizing transformation
+
+vsdata_treatment <- varianceStabilizingTransformation(dds_treatment, blind=FALSE)
+plotPCA(vsdata_treatment, intgroup="treatment")
+
+```
+
+
+```{r}
+library(microbiome)
+#Differential abundance testing
+#This is simply applying PCA to the centered log-ratio (CLR) transformed counts. 
+#CLR transform, The centered log-ratio (clr) transformation uses the geometric mean of the sample vector as the reference, Importantly, transformations are not normalizations: while normalizations claim to recast the data in absolute terms, transformations do not. The results of a transformation-based analysis must be interpreted with respect to the chosen reference. 
+(ps_clr <- microbiome::transform(ps, "clr"))   
+
+phyloseq::otu_table(ps)[1:5, 1:5]
+phyloseq::otu_table(ps_clr)[1:5, 1:5]
+
+#PCA via phyloseq
+ord_clr <- phyloseq::ordinate(ps_clr, "RDA")
+#Plot scree plot
+phyloseq::plot_scree(ord_clr) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+#Examine eigenvalues and % prop. variance explained. eigenvalues=In matematica, in particolare in algebra lineare, un autovettore di una funzione tra spazi vettoriali è un vettore non nullo la cui immagine è il vettore stesso moltiplicato per un numero (reale o complesso) detto autovalore.[1] Se la funzione è lineare, gli autovettori aventi in comune lo stesso autovalore, insieme con il vettore nullo, formano uno spazio vettoriale, detto autospazio.[2] La nozione di autovettore viene generalizzata dal concetto di vettore radicale o autovettore generalizzato.
+head(ord_clr$CA$eig)                                                  
+
+sapply(ord_clr$CA$eig[1:5], function(x) x / sum(ord_clr$CA$eig)) 
+
+#Scale axes and plot ordination
+clr1 <- ord_clr$CA$eig[1] / sum(ord_clr$CA$eig)
+clr2 <- ord_clr$CA$eig[2] / sum(ord_clr$CA$eig)
+phyloseq::plot_ordination(ps, ord_clr, type="samples", color="treatment") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = treatment), linetype = 2)
+
+
+ #Dispersion test and plot
+ dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr)$treatment)
+ 
+ dispr
+ 
+ plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+ 
+ boxplot(dispr, main = "", xlab = "")
+ 
+permutest(dispr, pairwise = TRUE)
+```
+
+
+```{r}
+rich <- estimate_richness(ps)
+#write.csv(rich, "alpha_indices.csv")
+
+#Test whether the observed number of OTUs differs significantly between seasons. We make a non-parametric test, the Wilcoxon rank-sum test (Mann-Whitney):
+
+#Observed
+pairwise.wilcox.test(rich$Observed, sample_data(ps)$treatment)
+
+#Shannon
+pairwise.wilcox.test(rich$Shannon, sample_data(ps)$treatment)
+
+#Simpson
+pairwise.wilcox.test(rich$Simpson, sample_data(ps)$treatment) 
+
+```
+
+install.packages('devtools')
+
+library(devtools)
+
+install_github("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis")
+
+```{r}
+library(pairwiseAdonis)
+dist.uf <- phyloseq::distance(ps, method = "bray")
+
+pairwise.adonis(dist.uf, sample_data(ps)$treatment)
+
+```
